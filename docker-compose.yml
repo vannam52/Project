@@ -1,0 +1,220 @@
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────
+  # PostgreSQL Database
+  # ─────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: vs_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-videosubtitle}
+      POSTGRES_USER: ${POSTGRES_USER:-vsuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vspassword}
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vsuser} -d ${POSTGRES_DB:-videosubtitle}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vs_network
+
+  # ─────────────────────────────────────────
+  # RabbitMQ Message Broker
+  # ─────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: vs_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-vsrabbit}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-vsrabbitpass}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks:
+      - vs_network
+
+  # ─────────────────────────────────────────
+  # MinIO Object Storage
+  # ─────────────────────────────────────────
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: vs_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-vsminio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-vsminiopass}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vs_network
+
+  # ─────────────────────────────────────────
+  # C# ASP.NET Core API
+  # ─────────────────────────────────────────
+  api:
+    build:
+      context: ./src/VideoSubtitle.API
+      dockerfile: Dockerfile
+    container_name: vs_api
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-videosubtitle};Username=${POSTGRES_USER:-vsuser};Password=${POSTGRES_PASSWORD:-vspassword}"
+      RabbitMQ__Host: rabbitmq
+      RabbitMQ__Username: ${RABBITMQ_USER:-vsrabbit}
+      RabbitMQ__Password: ${RABBITMQ_PASS:-vsrabbitpass}
+      MinIO__Endpoint: minio:9000
+      MinIO__AccessKey: ${MINIO_ROOT_USER:-vsminio}
+      MinIO__SecretKey: ${MINIO_ROOT_PASSWORD:-vsminiopass}
+      MinIO__BucketName: videos
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - vs_network
+
+  # ─────────────────────────────────────────
+  # Python Workers — dùng chung 1 image
+  # FIX: thống nhất tất cả biến env, bỏ escape sai
+  # ─────────────────────────────────────────
+  worker-audio:
+    build:
+      context: ./workers
+      dockerfile: Dockerfile
+    container_name: vs_worker_audio
+    restart: unless-stopped
+    command: python worker1_audio_extract.py
+    environment:
+      POSTGRES_DSN: "postgresql://${POSTGRES_USER:-vsuser}:${POSTGRES_PASSWORD:-vspassword}@postgres:5432/${POSTGRES_DB:-videosubtitle}"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-vsrabbit}:${RABBITMQ_PASS:-vsrabbitpass}@rabbitmq:5672/"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-vsminio}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-vsminiopass}
+      MINIO_BUCKET: videos
+      API_BASE_URL: http://api:8080
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - worker_tmp:/tmp/vs_processing
+    networks:
+      - vs_network
+
+  worker-stt:
+    build:
+      context: ./workers
+      dockerfile: Dockerfile
+    container_name: vs_worker_stt
+    restart: unless-stopped
+    command: python worker2_whisper_stt.py
+    environment:
+      POSTGRES_DSN: "postgresql://${POSTGRES_USER:-vsuser}:${POSTGRES_PASSWORD:-vspassword}@postgres:5432/${POSTGRES_DB:-videosubtitle}"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-vsrabbit}:${RABBITMQ_PASS:-vsrabbitpass}@rabbitmq:5672/"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-vsminio}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-vsminiopass}
+      MINIO_BUCKET: videos
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      API_BASE_URL: http://api:8080
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - worker_tmp:/tmp/vs_processing
+      - whisper_models:/root/.cache/whisper
+    networks:
+      - vs_network
+
+  worker-translate:
+    build:
+      context: ./workers
+      dockerfile: Dockerfile
+    container_name: vs_worker_translate
+    restart: unless-stopped
+    command: python worker3_translation.py
+    environment:
+      POSTGRES_DSN: "postgresql://${POSTGRES_USER:-vsuser}:${POSTGRES_PASSWORD:-vspassword}@postgres:5432/${POSTGRES_DB:-videosubtitle}"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-vsrabbit}:${RABBITMQ_PASS:-vsrabbitpass}@rabbitmq:5672/"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-vsminio}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-vsminiopass}
+      MINIO_BUCKET: videos
+      TRANSLATION_PROVIDER: ${TRANSLATION_PROVIDER:-google}
+      GOOGLE_TRANSLATE_API_KEY: ${GOOGLE_TRANSLATE_API_KEY:-}
+      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      API_BASE_URL: http://api:8080
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - worker_tmp:/tmp/vs_processing
+    networks:
+      - vs_network
+
+  worker-render:
+    build:
+      context: ./workers
+      dockerfile: Dockerfile
+    container_name: vs_worker_render
+    restart: unless-stopped
+    command: python worker4_render.py
+    environment:
+      POSTGRES_DSN: "postgresql://${POSTGRES_USER:-vsuser}:${POSTGRES_PASSWORD:-vspassword}@postgres:5432/${POSTGRES_DB:-videosubtitle}"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER:-vsrabbit}:${RABBITMQ_PASS:-vsrabbitpass}@rabbitmq:5672/"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-vsminio}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-vsminiopass}
+      MINIO_BUCKET: videos
+      API_BASE_URL: http://api:8080
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - worker_tmp:/tmp/vs_processing
+    networks:
+      - vs_network
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  minio_data:
+  worker_tmp:
+  whisper_models:
+
+networks:
+  vs_network:
+    driver: bridge

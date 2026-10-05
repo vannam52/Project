@@ -1,0 +1,6 @@
+@VideoSubtitle.API_HostAddress = http://localhost:5128
+
+GET {{VideoSubtitle.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
